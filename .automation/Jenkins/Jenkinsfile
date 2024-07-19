@@ -1,0 +1,175 @@
+pipeline{
+
+    agent any
+    tools {nodejs "NodeJS_21.6.1"}
+
+
+    options {
+        timestamps()
+        timeout(time:20, unit:'MINUTES')
+
+        office365ConnectorWebhooks([[
+            name: 'eTranzact MSTeams',
+            startNotification: true,
+            notifySuccess: true,
+            notifyAborted: true,
+            notifyFailure: true,
+            url: "${Build_Alerts_WebHook_URL}"
+        ]])
+    }
+
+
+    environment {
+        RELEASE_TAG = "release"
+        DEV_BUILD_TAG = "dev"
+        DEPLOYMENT_MANIFEST_NAME = "application_gh_crm_web_service.yaml"
+        // TAG = "${env.BUILD_NUMBER}"
+        REPOSITORY_NAME = "gh-crm-web-service"
+    }
+
+
+    stages{
+        // Checkout Code From GitHub
+        stage("CheckOut"){
+            steps{
+                script{
+                    checkout scm
+                }
+            }
+        }
+
+        // Compile Source Code
+        stage('Compile Source Code') {
+            steps {
+                    sh 'npm install'
+                }
+        }
+
+        // Run Static Code Analysis
+        stage('Code Quality Checks') {
+            steps {
+                script{
+                    def scannerHome = tool 'sonarscaner';
+                    withSonarQubeEnv('eTranzact GH Sonarqube Server') {
+                        sh "${scannerHome}/bin/sonar-scanner -Dsonar.projectKey=${REPOSITORY_NAME} -Dsonar.projectName=${REPOSITORY_NAME}"
+                    }
+                }
+            }
+        }
+
+        // Quality Gates Inspection
+        stage("Quality Gates Inspection") {
+            steps {
+                waitForQualityGate abortPipeline: true, credentialsId: 'Jenkins-Sonarqube-CICD-Secret-Access-Token'
+            }
+        }
+
+        // Install & Build Node Modules
+        stage("Build Node Modules"){
+            steps{
+                script{
+                    sh"""
+                        npm run build
+                    """
+                }
+            }
+        }
+
+        // Execute Unit Test Cases
+        // stage("Unit Tests"){
+        //     steps{
+        //         script{
+        //             sh"""
+        //                 npm test
+        //             """
+        //         }
+        //     }
+        // }
+
+        // Execute E2E Test Cases
+        // stage("Unit Tests"){
+        //     steps{
+        //         script{
+        //             sh"""
+        //                 npm test
+        //             """
+        //         }
+        //     }
+        // }
+
+        // Package Deployable Artifact & Publish To ECR Storage Repository
+        stage("Build Docker Image & Push To ECR"){
+            when{
+                anyOf {
+                    branch 'develop'
+
+                    expression {
+                        return env.BRANCH_NAME.startsWith('release/')
+                    }
+                }
+            }
+            steps{
+                script{
+                    def packageJSON = readJSON file: 'package.json'
+                    def packageJSONVersion = packageJSON.version //to get the app version number
+                    sh 'aws ecr get-login-password --region eu-west-1 | docker login --username AWS --password-stdin ${AWS_Account_URL}' //To login to ECR using role without access and secret keys
+
+                    if (env.BRANCH_NAME == 'develop') {
+
+                        APP_TAG = "dev-${packageJSONVersion}-${env.BUILD_NUMBER}"
+
+                        echo "Building Development Image: ${APP_TAG} From ${env.BRANCH_NAME}"
+                        app = docker.build("$REPOSITORY_NAME:$APP_TAG")
+                    }
+
+                    else {
+
+                        APP_TAG = "release-${packageJSONVersion}-${env.BUILD_NUMBER}"
+
+                        echo "Building Release Image: ${APP_TAG} From ${env.BRANCH_NAME}"
+                        app = docker.build("$REPOSITORY_NAME:$APP_TAG")
+                    }
+
+                    docker.withRegistry("${ECR_Repository_URL}/${REPOSITORY_NAME}") {
+                    app.push("$APP_TAG")
+
+                    }
+                }
+            }
+        }
+
+        // Deploy To SandBox Environment [If Branch == Develop]
+        stage ('Deploy To SandBox Environment') {
+            when{
+                anyOf {
+                    branch 'develop'
+                    expression {
+                        return env.BRANCH_NAME.startsWith('release/')
+                    }
+                }
+            }
+            steps {
+
+                script {
+                    echo "Triggering SandBox Environment Deployment Script"
+                    // BUILD_TRIGGERED_BY = currentBuild.getBuildCauses()[0].userId
+                    // echo "BUILD_TRIGGERED_BY: ${BUILD_TRIGGERED_BY}"
+                    echo "${APP_TAG}"
+                    build job: 'gh-argocd-sandbox-deployment-job', parameters: [string(name: 'IMAGETAG', value: "${APP_TAG}"), string(name: 'DEPLOYMENT_MANIFEST_NAME', value: "${DEPLOYMENT_MANIFEST_NAME}"), string(name: 'REPOSITORY_NAME', value: "${REPOSITORY_NAME}"), string(name: 'ENVIRONMENT', value: 'sandbox')]
+                }
+            }
+        }
+
+    }
+    post{
+        always{
+            cleanWs()
+        }
+        success{
+            echo "========pipeline executed successfully ========"
+        }
+        failure{
+            echo "========pipeline execution failed========"
+        }
+    }
+}
